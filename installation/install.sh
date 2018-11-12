@@ -336,6 +336,16 @@ echo_subtitle(){
     echo -n "    $*:"|tee -a $ZSTACK_INSTALL_LOG
 }
 
+enable_tomcat_linking() {
+    local context_xml_file=$ZSTACK_INSTALL_ROOT/apache-tomcat/conf/context.xml
+    if ! grep -q -w allowLinking $context_xml_file; then
+        new_line="    <Resources allowLinking=\"true\"></Resources>\r"
+        sed -i "/<Context>/a\\$new_line" $context_xml_file
+        echo "Tomcat allowLinking enabled."
+        sync
+    fi
+}
+
 disable_more_methods() {
     web_xml_file=$ZSTACK_INSTALL_ROOT/apache-tomcat/conf/web.xml
     sed -i "/<\/web-app>/d" $web_xml_file
@@ -362,6 +372,8 @@ disable_more_methods() {
 </web-app>\r
 EOF
 )" >> $web_xml_file
+    echo "Tomcat HTTP methods updated."
+    sync
 }
 
 udpate_tomcat_info() {
@@ -380,11 +392,13 @@ udpate_tomcat_info() {
         sed -i "/^server.info=/c\server.info=X\r" $properties_file
         sed -i "/^server.number=/c\server.number=5.5\r" $properties_file
         sed -i "/^server.built=/c\server.built=Dec 1 2015 22:30:46 UTC\r" $properties_file
+        sync
 
         jar cvf catalina.jar org META-INF > /dev/nul
         if [ $? -eq 0 ]; then
             rm -f $jar_file
             mv catalina.jar $jar_file
+            echo "Tomcat server info updated."
         else
             echo "Zip $jar_file error."
         fi
@@ -407,6 +421,7 @@ set_tomcat_config() {
     # Fix ZSTAC-13580
     sed -i '/autoDeploy/a \ \ \ \ \ \ \ \ <Context path="/zstack" reloadable="false" crossContext="true" allowLinking="true"/>' $tomcat_config_path/server.xml
 
+    enable_tomcat_linking
     disable_more_methods
     udpate_tomcat_info
 }
