@@ -103,6 +103,15 @@ class UpdateDependencyRsp(kvmagent.AgentResponse):
     def __init__(self):
         super(UpdateDependencyRsp, self).__init__()
 
+class SetPageTableExtensionCmd(kvmagent.AgentCommand):
+    def __init__(self):
+        super(SetPageTableExtensionCmd, self).__init__()
+        self.hostUuid = None
+
+class SetPageTableExtensionRsp(kvmagent.AgentResponse):
+    def __init__(self):
+        super(SetPageTableExtensionRsp, self).__init__()
+
 logger = log.get_logger(__name__)
 
 def _get_memory(word):
@@ -233,6 +242,7 @@ class HostPlugin(kvmagent.KvmAgent):
     SETUP_MOUNTABLE_PRIMARY_STORAGE_HEARTBEAT = "/host/mountableprimarystorageheartbeat"
     UPDATE_OS_PATH = "/host/updateos"
     UPDATE_DEPENDENCY = "/host/updatedependency"
+    SET_PAGE_TABLE_EXTENSION = "/host/setPageTableExtension"
 
     queue = Queue.Queue()
 
@@ -387,6 +397,31 @@ class HostPlugin(kvmagent.KvmAgent):
         with open(heartbeat_file, 'w') as fd:
             fd.write(jsonobject.dumps(hb))
         return True
+
+    def _get_intel_ept(self):
+        STATE_FILE='/sys/module/kvm_intel/parameters/ept'
+        with open(STATE_FILE, 'r') as reader:
+            text = reader.read()
+        return text is not None and text.strip() == "Y"
+
+    def _set_intel_ept(self, new_ept):
+        CONF_FILE = '/etc/modprobe.d/intel-ept.conf'
+        with open(CONF_FILE, 'w') as writer:
+            writer.write("options kvm_intel ept=%d" % new_ept)
+
+        error = None
+        old_ept = self._get_intel_ept()
+        if new_ept != old_ept:
+            if shell.run("modprobe -r kvm-intel") != 0:
+                error = "failed to remove kvm-intel"
+                logger.warn("_set_intel_ept: %s" % error)
+            elif shell.run("modprobe kvm-intel") != 0:
+                error = "failed to load kvm-intel"
+                logger.warn("_set_intel_ept: %s" % error)
+            else:
+                logger.info("_set_intel_ept(%s) OK." % new_ept)
+
+        return error
 
     @kvmagent.replyerror
     def setup_heartbeat_file(self, req):
@@ -564,6 +599,18 @@ if __name__ == "__main__":
             logger.debug("successfully run: %s" % yum_cmd)
         return jsonobject.dumps(rsp)
 
+    @kvmagent.replyerror
+    @in_bash
+    def set_page_table_extension(self, req):
+        rsp = SetPageTableExtensionRsp()
+        cmd = jsonobject.loads(req[http.REQUEST_BODY])
+        error = self._set_intel_ept(not cmd.disabled)
+        rsp.disabled = not self._get_intel_ept()
+        if error is not None:
+            rsp.success = False
+            rsp.error = error
+        return jsonobject.dumps(rsp)
+
     def start(self):
         self.host_uuid = None
 
@@ -577,6 +624,7 @@ if __name__ == "__main__":
         http_server.register_async_uri(self.GET_USB_DEVICES_PATH, self.get_usb_devices)
         http_server.register_async_uri(self.UPDATE_OS_PATH, self.update_os)
         http_server.register_async_uri(self.UPDATE_DEPENDENCY, self.update_dependency)
+        http_server.register_async_uri(self.SET_PAGE_TABLE_EXTENSION, self.set_page_table_extension)
 
         self.heartbeat_timer = {}
         self.libvirt_version = self._get_libvirt_version()
