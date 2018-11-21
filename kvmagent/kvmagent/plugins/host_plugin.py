@@ -399,28 +399,27 @@ class HostPlugin(kvmagent.KvmAgent):
         return True
 
     def _get_intel_ept(self):
-        STATE_FILE='/sys/module/kvm_intel/parameters/ept'
-        with open(STATE_FILE, 'r') as reader:
+        text = None
+        with open('/sys/module/kvm_intel/parameters/ept', 'r') as reader:
             text = reader.read()
-        return text is not None and text.strip() == "Y"
+        return text is None or text.strip() == "Y"
 
     def _set_intel_ept(self, new_ept):
-        CONF_FILE = '/etc/modprobe.d/intel-ept.conf'
-        with open(CONF_FILE, 'w') as writer:
-            writer.write("options kvm_intel ept=%d" % new_ept)
-
         error = None
         old_ept = self._get_intel_ept()
         if new_ept != old_ept:
+            param = "ept=%d" % new_ept
             if shell.run("modprobe -r kvm-intel") != 0:
-                error = "failed to remove kvm-intel"
-                logger.warn("_set_intel_ept: %s" % error)
-            elif shell.run("modprobe kvm-intel") != 0:
+                error = "failed to remove kvm-intel, please stop the running VM on the host and try again."
+            elif shell.run("modprobe kvm-intel %s" % param) != 0:
                 error = "failed to load kvm-intel"
-                logger.warn("_set_intel_ept: %s" % error)
             else:
+                with open('/etc/modprobe.d/intel-ept.conf', 'w') as writer:
+                    writer.write("options kvm_intel %s" % param)
                 logger.info("_set_intel_ept(%s) OK." % new_ept)
 
+        if error is not None:
+            logger.warn("_set_intel_ept: %s" % error)
         return error
 
     @kvmagent.replyerror
