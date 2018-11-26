@@ -4231,12 +4231,12 @@ class VmPlugin(kvmagent.KvmAgent):
             bitmap = bitmaps[deviceId]
 
             def get_backup_args():
-                if cmd.bitmap:
-                    return cmd.bitmap, 'full' if cmd.mode == 'full' else 'auto', nodename, speed
+                if bitmap:
+                    return bitmap, 'full' if cmd.mode == 'full' else 'auto', nodename, speed
 
                 bm = 'zsbitmap%d' % deviceId
                 if cmd.mode == 'full':
-                    return bitmap, 'full', nodename, speed
+                    return bm, 'full', nodename, speed
 
                 imf = self.push_backing_files(isc, cmd.hostname, drivertype, source)
                 if not imf:
