@@ -20,6 +20,16 @@ def info_verbose(*msg):
     sys.stdout.write(out)
 
 
+def collect_fail_verbose(*msg):
+    if len(msg) == 1:
+        out = '%s\n' % ''.join(msg)
+    else:
+        out = ''.join(msg)
+    now = datetime.now()
+    out = "%s " % str(now) + out
+    return out
+
+
 class CtlError(Exception):
     pass
 
@@ -40,20 +50,21 @@ def decode_conf_yml(args):
     yml_conf_dir = None
     name_array = []
 
-    if args.p is None:
-        yml_conf_dir = base_conf_path + default_yml_full
-    elif args.p == 'mn-only':
+    if args.mn_only:
         yml_conf_dir = base_conf_path + default_yml_mn_only
-    elif args.p == 'mn-db':
+    elif args.mn_db:
         yml_conf_dir = base_conf_path + default_yml_mn_db
-    elif args.p == 'full':
+    elif args.full:
         yml_conf_dir = base_conf_path + default_yml_full
-    elif args.p == 'full-db':
+    elif args.full_db:
         yml_conf_dir = base_conf_path + default_yml_full_db
-    elif args.p == 'mn-host':
+    elif args.mn_host:
         yml_conf_dir = base_conf_path + default_yml_mn_host
     else:
-        yml_conf_dir = args.p
+        if args.p is None:
+            yml_conf_dir = base_conf_path + default_yml_full
+        else:
+            yml_conf_dir = args.p
 
     decode_result = {}
     decode_error = None
@@ -110,6 +121,7 @@ def decode_conf_yml(args):
                     break
         decode_result[collect_type] = dict(
             (key, value) for key, value in conf_value.items() if key == 'list' or key == 'logs')
+        name_array = []
 
     decode_result['decode_error'] = decode_error
     return decode_result
@@ -119,6 +131,7 @@ class CollectFromYml(object):
     failed_flag = False
     f_date = None
     t_date = None
+    since = None
     logger_dir = '/var/log/zstack/'
     logger_file = 'zstack-ctl.log'
     zstack_log_dir = "/var/log/zstack/"
@@ -154,7 +167,30 @@ class CollectFromYml(object):
     def build_collect_cmd(self, dir_value, file_value, collect_dir):
         cmd = 'find %s' % dir_value
         if file_value is not None:
-            cmd = cmd + ' -name %s' % file_value
+            if file_value.startswith('regex='):
+                cmd = cmd + ' -regex \'%s\'' % file_value
+            else:
+                cmd = cmd + ' -name \'%s\'' % file_value
+        cmd = cmd + ' -exec ls --full-time {} \; | sort -k6 | awk \'{print $6\":\"$7\"|\"$9\"|\"$5}\''
+        cmd = cmd + ' | awk -F \'|\' \'BEGIN{preview=0;} {if(NR==1 && ( $1 > \"%s\" || (\"%s\" < $1 && $1  <= \"%s\"))) print $2\"|\"$3; \
+                               else if ((\"%s\" < $1 && $1 <= \"%s\") || ( $1> \"%s\" && preview < \"%s\")) print $2\"|\"$3; preview = $1}\''\
+              % (self.t_date, self.f_date, self.t_date, self.f_date, self.t_date, self.t_date, self.t_date)
+        if self.check:
+            cmd = cmd + '| awk -F \'|\' \'BEGIN{size=0;} \
+                   {size = size + $2/1024/1024;}  END{size=sprintf("%.1f", size); print size\"M\";}\''
+        else:
+            cmd = cmd + ' | awk -F \'|\' \'{print $1}\'| xargs -I {} /bin/cp -rf {} %s' % collect_dir
+        return cmd
+
+    def build_collect_cmd_old(self, dir_value, file_value, collect_dir):
+        cmd = 'find %s' % dir_value
+        if file_value is not None:
+            if file_value.startswith('regex='):
+                cmd = cmd + ' -regex \'%s\'' % file_value
+            else:
+                cmd = cmd + ' -name \'%s\'' % file_value
+        if self.since is not None:
+            cmd = cmd + ' -mtime -%s' % self.since
         if self.f_date is not None:
             cmd = cmd + ' -newermt \'%s\'' % self.f_date
         if self.t_date is not None:
@@ -278,6 +314,7 @@ class CollectFromYml(object):
             warn("unknown target type: %s" % type)
 
     def generate_tar_ball(self, run_command_dir, detail_version, time_stamp):
+        info_verbose("Compressing log files ...")
         (status, output) = commands.getstatusoutput("cd %s && tar zcf collect-log-%s-%s.tar.gz collect-log-%s-%s"
                                                     % (run_command_dir, detail_version, time_stamp, detail_version, time_stamp))
         if status != 0:
@@ -287,7 +324,7 @@ class CollectFromYml(object):
         command = "cd %s && tar zcf ../collect-log.tar.gz . --ignore-failed-read --warning=no-file-changed || true" % tmp_log_dir
         run_remote_command(command, host_post_info)
         fetch_arg = FetchArg()
-        fetch_arg.src =  "%s/../collect-log.tar.gz " % tmp_log_dir
+        fetch_arg.src = "%s../collect-log.tar.gz " % tmp_log_dir
         fetch_arg.dest = local_collect_dir
         fetch_arg.args = "fail_on_missing=yes flat=yes"
         fetch(fetch_arg, host_post_info)
@@ -369,13 +406,13 @@ class CollectFromYml(object):
                     error_log_name = "%s:%s:%s" % (type, 'localhost', log['name'])
                     dest_log_dir = local_collect_dir
                     if 'name' in log:
-                        dest_log_dir = local_collect_dir + '/%s/' % log['name']
+                        dest_log_dir = local_collect_dir + '%s/' % log['name']
                         if not os.path.exists(dest_log_dir):
                             os.makedirs(dest_log_dir)
                     if 'exec' in log:
                         timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
                         command = log['exec']
-                        file_path = dest_log_dir + timestamp + '.gz'
+                        file_path = dest_log_dir + '%s_%s' % (log['name'], timestamp) + '.gz'
                         cmd = shell.ShellCmd('%s | gzip > %s' % (command, file_path))
                         cmd(False)
                         if cmd.return_code == 0:
@@ -425,13 +462,57 @@ class CollectFromYml(object):
         self.lock.acquire()
         try:
             self.fail_count += fail_log_number
-            self.fail_list[fail_log_name] = fail_cause
+            self.fail_list[collect_fail_verbose('[ ' + fail_log_name + ' ]')] = fail_cause
         except Exception:
             self.lock.release()
         self.lock.release()
 
+    @ignoreerror
+    def get_sharedblock_log(self, host_post_info, tmp_log_dir):
+        info_verbose("Collecting sharedblock log from : %s ..." % host_post_info.host)
+        target_dir = tmp_log_dir + "sharedblock"
+        command = "mkdir -p %s " % target_dir
+        run_remote_command(command, host_post_info)
+
+        command = "lsblk -p -o NAME,TYPE,FSTYPE,LABEL,UUID,VENDOR,MODEL,MODE,WWN,SIZE > %s/lsblk_info || true" % target_dir
+        run_remote_command(command, host_post_info)
+        command = "ls -l /dev/disk/by-id > %s/ls_dev_disk_by-id_info && echo || true" % target_dir
+        run_remote_command(command, host_post_info)
+        command = "ls -l /dev/disk/by-path >> %s/ls_dev_disk_by-id_info && echo || true" % target_dir
+        run_remote_command(command, host_post_info)
+        command = "multipath -ll -v3 >> %s/ls_dev_disk_by-id_info || true" % target_dir
+        run_remote_command(command, host_post_info)
+
+        command = "cp /var/log/sanlock.log* %s || true" % target_dir
+        run_remote_command(command, host_post_info)
+        command = "cp /var/log/lvmlock/lvmlockd.log %s || true" % target_dir
+        run_remote_command(command, host_post_info)
+        command = "lvmlockctl -i > %s/lvmlockctl_info || true" % target_dir
+        run_remote_command(command, host_post_info)
+        command = "sanlock client status > %s/sanlock_client_info || true" % target_dir
+        run_remote_command(command, host_post_info)
+        command = "sanlock client host_status> %s/sanlock_host_info || true" % target_dir
+        run_remote_command(command, host_post_info)
+
+        command = "lvs --nolocking -oall > %s/lvm_lvs_info || true" % target_dir
+        run_remote_command(command, host_post_info)
+        command = "vgs --nolocking -oall > %s/lvm_vgs_info || true" % target_dir
+        run_remote_command(command, host_post_info)
+        command = "lvmconfig --type diff > %s/lvm_config_diff_info || true" % target_dir
+        run_remote_command(command, host_post_info)
+        command = "cp -r /etc/lvm/ %s || true" % target_dir
+        run_remote_command(command, host_post_info)
+        command = "cp -r /etc/sanlock %s || true" % target_dir
+        run_remote_command(command, host_post_info)
+
+    def check_host_reachable_in_queen(self, host_post_info):
+        self.lock.acquire()
+        result = check_host_reachable(host_post_info)
+        self.lock.release()
+        return result
+
     def get_host_log(self, host_post_info, log_list, collect_dir, type):
-            if check_host_reachable(host_post_info) is True:
+            if self.check_host_reachable_in_queen(host_post_info) is True:
                 if self.check:
                     for log in log_list:
                         if 'exec' in log:
@@ -447,7 +528,7 @@ class CollectFromYml(object):
                     local_collect_dir = None
                     info_verbose("Collecting log from %s %s ..." % (type, host_post_info.host))
                     local_collect_dir = collect_dir + '%s-%s/' % (type, host_post_info.host)
-                    tmp_log_dir = "%s/tmp-log/" % self.zstack_log_dir
+                    tmp_log_dir = "%stmp-log/" % self.zstack_log_dir
                     try:
                         # file system broken shouldn't block collect log process
                         if not os.path.exists(local_collect_dir):
@@ -460,14 +541,14 @@ class CollectFromYml(object):
                             if 'name' in log:
                                 command = "mkdir -p %s" % tmp_log_dir + '/%s/' % log['name']
                                 run_remote_command(command, host_post_info)
-                                dest_log_dir = tmp_log_dir + '/%s/' % log['name']
+                                dest_log_dir = tmp_log_dir + '%s/' % log['name']
                             if 'exec' in log:
                                 timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
                                 command = log['exec']
-                                file_path = dest_log_dir + timestamp + '.gz'
-                                cmd = shell.ShellCmd('%s | gzip > %s' % (command, file_path))
-                                cmd(False)
-                                if cmd.return_code == 0:
+                                file_path = dest_log_dir + '%s_%s' % (log['name'], timestamp) + '.gz'
+                                (status, output) = run_remote_command('%s | gzip > %s' % (command, file_path), \
+                                                                      host_post_info, return_status=True, return_output=True)
+                                if status is True:
                                     self.add_success_count()
                                     logger.info("exec shell %s successfully!You can check the file at %s" % (command, file_path))
                                 else:
@@ -479,7 +560,7 @@ class CollectFromYml(object):
                                     if status is True:
                                         self.add_success_count()
                                         command = 'test "$(ls -A "%s" 2>/dev/null)" || echo The directory is empty' % dest_log_dir
-                                        (status, output) = commands.getstatusoutput(command)
+                                        (status, output) = run_remote_command(command, host_post_info, return_status=True, return_output=True)
                                         if "The directory is empty" in output:
                                             warn("Didn't find log:%s on %s %s" % (log['name'], type, host_post_info.host))
                                             logger.warn("Didn't find log:%s on %s %s" % (log['name'], type, host_post_info.host))
@@ -489,6 +570,8 @@ class CollectFromYml(object):
                                     self.add_fail_count(1, error_log_name, "the dir path %s did't find on %s %s" % (log['dir'], type, host_post_info.host))
                                     logger.warn("the dir path %s did't find on %s %s" % (log['dir'], type, host_post_info.host))
                                     warn("the dir path %s did't find on %s %s" % (log['dir'], type, host_post_info.host))
+                        if type == 'host':
+                            self.get_sharedblock_log(host_post_info, tmp_log_dir)
                     except SystemExit:
                         warn("collect log on host %s failed" % host_post_info.host)
                         logger.warn("collect log on host %s failed" % host_post_info.host)
@@ -526,16 +609,53 @@ class CollectFromYml(object):
         for key in sorted(self.check_result.keys()):
             print '%-50s%-50s' % (key, colored(self.check_result[key], 'green'))
 
+    def format_date(self, str_date):
+        d_arr = str_date.split('_')
+        if len(d_arr) == 1 or len(d_arr) == 2:
+            ymd_array = d_arr[0].split('-')
+            if len(ymd_array) == 3:
+                year = ymd_array[0]
+                month = ymd_array[1]
+                day = ymd_array[2]
+                if len(d_arr) == 1:
+                    return datetime(int(year), int(month), int(day)).strftime('%Y-%m-%d:%H:%M:%S')
+                else:
+                    hms_array = d_arr[1].split(':')
+                    hour = hms_array[0] if len(hms_array) == 1 is not None else '00'
+                    minute = hms_array[1] if len(hms_array) == 2 is not None else '00'
+                    sec = hms_array[2] if len(hms_array) == 3 is not None else '00'
+                    return datetime(int(year), int(month), int(day), int(hour), int(minute), int(sec))\
+                        .strftime('%Y-%m-%d:%H:%M:%S')
+            else:
+                raise CtlError('error datetime format:%s' % str_date)
+        else:
+            raise CtlError('error datetime format:%s' % str_date)
+
     def run(self, collect_dir, detail_version, time_stamp, args):
         run_command_dir = os.getcwd()
         if not os.path.exists(collect_dir) and args.check is not True:
             os.makedirs(collect_dir)
-        if args.from_date is None:
-            self.f_date = (datetime.now() + timedelta(days=-1)).strftime('%Y-%m-%d %H:%M')
-        elif args.from_date != '-1':
-            self.f_date = args.from_date.replace('_', ' ')
-        if args.to_date is not None and args.to_date != '-1':
-            self.t_date = args.to_date.replace('_', ' ')
+
+        if args.since is None:
+            if args.from_date is None:
+                self.f_date = (datetime.now() + timedelta(days=-1)).strftime('%Y-%m-%d:%H:%M')
+            elif args.from_date == '-1':
+                self.f_date = '0000-00-00:00:00'
+            else:
+                self.f_date = self.format_date(args.from_date)
+            if args.to_date is not None and args.to_date != '-1':
+                self.t_date = self.format_date(args.to_date)
+            else:
+                self.t_date = datetime.now().strftime('%Y-%m-%d:%H:%M')
+        else:
+            if args.since.endswith('d') or args.since.endswith('D'):
+                self.f_date = (datetime.now() + timedelta(days=float('-%s' % (args.since[:-1])))).strftime('%Y-%m-%d:%H:%M')
+            elif args.since.endswith('h') or args.since.endswith('H'):
+                self.f_date = (datetime.now() + timedelta(days=float('-%s' % round(float(args.since[:-1]) / 24, 2)))).strftime('%Y-%m-%d:%H:%M')
+            else:
+                self.f_date = (datetime.now() + timedelta(days=float(-args.sincep[:-1]))).strftime('%Y-%m-%d:%H:%M')
+            self.t_date = datetime.now().strftime('%Y-%m-%d:%H:%M')
+
         self.check = True if args.check else False
 
         decode_result = decode_conf_yml(args)
@@ -565,4 +685,4 @@ class CollectFromYml(object):
             with open(summary_file, 'a+') as f:
                 f.write('success:%s,fail:%s' % (self.success_count, self.fail_count) + '\n')
                 for key, value in self.fail_list.items():
-                    f.write('fail collect log name:%s, error:%s' % (key, value) + '\n')
+                    f.write('%s, %s' % (key, value) + '\n')

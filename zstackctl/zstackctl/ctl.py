@@ -5321,15 +5321,19 @@ class ConfiguredCollectLogCmd(Command):
         parser.add_argument('--to-date',
                             help='collect logs up to datetime below format:\'yyyy-MM-dd\' or \'yyyy-MM-dd_hh:mm:ss\'',
                             default=None)
-        parser.add_argument('-p', help='you can input the path to your custom yaml or use five default yml. \
-                                       \'mn-only\' : \'only collect managenode log\', \
-                                       \'mn-db\' : \'collect managementnode log and db\', \
-                                       \'full\' : \'collect full log except db (default choose)\', \
-                                       \'full-db\' : \'collect full log and db\', \
-                                       \'mn-host\' : \'collect managementnode and host log\'',
+        parser.add_argument('--since',
+                            help='collect logs from N days(--since Nd) or hours(--since Nh) before, for example,if you input \'--since 2d\',\
+                                 we will collect logs from the previous two days',
                             default=None)
         parser.add_argument('--check', help='preview collection file size', action="store_true", default=False)
-
+        parser.add_argument('-p', help='input the path to your custom yaml',
+                            default=None)
+        parser.add_argument('--full', help='collect full log except db (default choose)', action="store_true",
+                            default=False)
+        parser.add_argument('--full-db', help='collect full log and db', action="store_true", default=False)
+        parser.add_argument('--mn-only', help='only collect managenode log', action="store_true", default=False)
+        parser.add_argument('--mn-db', help='collect managementnode log and db', action="store_true", default=False)
+        parser.add_argument('--mn-host', help='collect managementnode and host log', action="store_true", default=False)
 
     def run(self, args):
         # dump mn status
