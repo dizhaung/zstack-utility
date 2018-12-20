@@ -7,7 +7,9 @@ import shutil
 import socket
 import fcntl
 import struct
+import hashlib
 import traceback
+from jinja2 import Template
 from netaddr import IPNetwork, IPAddress
 
 import zstacklib.utils.daemon as daemon
@@ -97,8 +99,10 @@ class PxeServerAgent(object):
     VSFTPD_LOG_PATH = BAREMETAL_LOG_PATH + "vsftpd.log"
     PXELINUX_CFG_PATH = TFTPBOOT_PATH + "pxelinux.cfg/"
     PXELINUX_DEFAULT_CFG = PXELINUX_CFG_PATH + "default"
+    # we use `KS_CFG_PATH` to hold kickstart/preseed/autoyast preconfiguration files
     KS_CFG_PATH = VSFTPD_ROOT_PATH + "ks/"
     INSPECTOR_KS_CFG = KS_CFG_PATH + "inspector_ks.cfg"
+    ZSTACK_SCRIPTS_PATH = VSFTPD_ROOT_PATH + "scripts/"
     NGINX_MN_PROXY_CONF_PATH = "/etc/nginx/conf.d/pxe_mn/"
     NGINX_TERMINAL_PROXY_CONF_PATH = "/etc/nginx/conf.d/terminal/"
     NOVNC_INSTALL_PATH = BAREMETAL_LIB_PATH + "noVNC/"
@@ -421,111 +425,213 @@ http {
     def create_bm_configs(self, req):
         cmd = json_object.loads(req[http.REQUEST_BODY])
         rsp = AgentResponse()
+
+        # check preconfiguration md5sum
+        if hashlib.md5(cmd.preconfigurationContent).hexdigest() != cmd.preconfigurationMd5sum:
+            raise PxeServerError("preconfiguration content not complete")
+
         self.uuid = cmd.uuid
         self.dhcp_interface = cmd.dhcpInterface
+        self._create_pxelinux_cfg(cmd)
+        self._create_preconfiguration_file(cmd)
+        logger.info("successfully created pxelinux.cfg and preconfiguration file for baremetal instance[uuid:%s] on pxeserver[uuid:%s]" % (cmd.bmUuid, self.uuid))
+        return json_object.dumps(rsp)
 
-        # create ks.cfg
-        pxeserver_dhcp_nic_ip = self._get_ip_address(cmd.dhcpInterface).strip()
+    def _create_pxelinux_cfg(self, cmd):
         ks_cfg_name = cmd.pxeNicMac.replace(":", "-")
-        ks_cfg_file = os.path.join(self.KS_CFG_PATH, ks_cfg_name)
-        ks_tmpl_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'ks_tmpl')
-        is_zstack_iso = os.path.exists(os.path.join(self.VSFTPD_ROOT_PATH, cmd.imageUuid, "Extra", "qemu-kvm-ev"))
-
-        # if is_zstack_iso, then need more post script
-        zstack_iso_post_script = """
-# wget zstack-dvd from ftp server
-cd /opt && wget -e robots=off -r -l 10 --no-parent --reject "index.html*" -nH ftp://{PXESERVER_DHCP_NIC_IP}/zstack-dvd/
-
-# modify logind.conf, so that only two ttys are avaiable
-echo "NAutoVTs=2" >> /etc/systemd/logind.conf
-echo "ReserveVT=2" >> /etc/systemd/logind.conf
-
-# set tuned profile to virtual-host
-echo virtual-host > /etc/tuned/active_profile
-
-# install npyscreen and psutil
-cd /opt/zstack-dvd/Extra/pip/npyscreen
-python setup.py install
-cd /opt/zstack-dvd/Extra/pip/psutil
-python setup.py install
-
-# hide native yum repos
-mkdir -p /opt/zstack-dvd/Extra/native-repos
-mv /etc/yum.repos.d/CentOS-*.repo /opt/zstack-dvd/Extra/native-repos
-
-# install zstack repos
-cp /opt/zstack-dvd/repos/* /etc/yum.repos.d/
-
-# install scripts
-install /opt/zstack-dvd/scripts/zs* /usr/local/bin/
-
-# configs
-sed -i "s/ONBOOT.*/ONBOOT\=yes/g" /etc/sysconfig/network-scripts/ifcfg-*
-sed -i "s/SELINUX\=enforcing/SELINUX\=disabled/g" /etc/selinux/config
-sed -i "s/#UseDNS yes/UseDNS no/g" /etc/ssh/sshd_config
-echo 'IndexOptions NameWidth=*' >> /etc/httpd/conf/httpd.conf
-rm -f /etc/httpd/conf.d/welcome.conf
-echo -e 'export TMOUT=6000\nreadonly TMOUT' >> /etc/profile
-unlink /etc/libvirt/qemu/networks/autostart/default.xml
-
-# history
-cat > /etc/profile.d/history.sh << EOF
-shopt -s histappend
-HISTTIMEFORMAT='%F %T '
-HISTSIZE="5000"
-HISTFILESIZE=5000
-PROMPT_COMMAND="history -a"
-export HISTTIMEFORMAT HISTSIZE HISTFILESIZE PROMPT_COMMAND
-EOF
-
-# services
-chkconfig NetworkManager off
-chkconfig firewalld off
-chkconfig httpd off
-chkconfig nfs off
-chkconfig iptables on
-chkconfig network on
-chkconfig atd on
-""".format(PXESERVER_DHCP_NIC_IP=pxeserver_dhcp_nic_ip)
-
-        zstack_iso_packages = """
-%packages
-@^zstack-host
-@core
-@zstack-host
-chrony
-kexec-tools
-%end
-"""
-        with open("%s/generic_ks_tmpl" % ks_tmpl_path, 'r') as fr:
-            generic_ks_cfg = fr.read() \
-                .replace("EXTRA_REPO", "repo --name=qemu-kvm-ev --baseurl=ftp://%s/%s/Extra/qemu-kvm-ev" % (pxeserver_dhcp_nic_ip, cmd.imageUuid) if is_zstack_iso else "") \
-                .replace("PACKAGES_FOR_ZSTACK_ISO", zstack_iso_packages if is_zstack_iso else "") \
-                .replace("POST_SCRIPT_FOR_ZSTACK_ISO", zstack_iso_post_script if is_zstack_iso else "") \
-                .replace("PXESERVER_DHCP_NIC_IP", pxeserver_dhcp_nic_ip) \
-                .replace("BMUUID", cmd.bmUuid) \
-                .replace("IMAGEUUID", cmd.imageUuid) \
-                .replace("ROOT_PASSWORD", "rootpw --iscrypted " + cmd.customPassword) \
-                .replace("NETWORK_SETTING", cmd.nicCfgs)
-            with open(ks_cfg_file, 'w') as fw:
-                fw.write(generic_ks_cfg)
-
-        # create pxelinux.cfg
         pxe_cfg_file = os.path.join(self.PXELINUX_CFG_PATH, "01-" + ks_cfg_name)
-        pxelinux_cfg = """default {IMAGEUUID}
-prompt 0
-label {IMAGEUUID}
-kernel {IMAGEUUID}/vmlinuz
-ipappend 2
-append initrd={IMAGEUUID}/initrd.img devfs=nomount ksdevice=bootif ks=ftp://{PXESERVER_DHCP_NIC_IP}/ks/{KS_CFG_NAME} vnc
-""".format(PXESERVER_DHCP_NIC_IP=pxeserver_dhcp_nic_ip,
-           IMAGEUUID=cmd.imageUuid,
-           KS_CFG_NAME=ks_cfg_name)
+        pxeserver_dhcp_nic_ip = self._get_ip_address(cmd.dhcpInterface).strip()
+
+        append = ""
+        if cmd.preconfigurationType == 'kickstart':
+            append = 'devfs=nomount ksdevice=bootif ks=ftp://{PXESERVER_DHCP_NIC_IP}/ks/{KS_CFG_NAME} vnc'
+        elif cmd.preconfigurationType == 'preseed':
+            append = 'auto=true priority=critical url=ftp://{PXESERVER_DHCP_NIC_IP}/ks/{KS_CFG_NAME}'
+        elif cmd.preconfigurationType == 'autoyast':
+            append = 'install=ftp://{PXESERVER_DHCP_NIC_IP}/{IMAGEUUID}/ autoyast=ftp://{PXESERVER_DHCP_NIC_IP}/ks/{KS_CFG_NAME} vnc'
+        append = append.format(PXESERVER_DHCP_NIC_IP=pxeserver_dhcp_nic_ip,
+                IMAGEUUID=cmd.imageUuid,
+                KS_CFG_NAME=ks_cfg_name)
+
+        pxelinux_cfg = ("default {IMAGEUUID}\n"
+                        "prompt 0\n"
+                        "ipappend 2\n"
+                        "label {IMAGEUUID}\n"
+                        "kernel {IMAGEUUID}/vmlinuz\n"
+                        "append initrd={IMAGEUUID}/initrd.img {APPEND}").format(
+            PXESERVER_DHCP_NIC_IP=pxeserver_dhcp_nic_ip,
+            IMAGEUUID=cmd.imageUuid,
+            KS_CFG_NAME=ks_cfg_name,
+            APPEND=append)
+
         with open(pxe_cfg_file, 'w') as f:
             f.write(pxelinux_cfg)
 
-        logger.info("successfully created pxelinux.cfg and ks.cfg for baremetal instance[uuid:%s] on pxeserver[uuid:%s]" % (cmd.bmUuid, self.uuid))
-        return json_object.dumps(rsp)
+    def _create_preconfiguration_file(self, cmd):
+        # in case user didn't seleted a preconfiguration template etc.
+        cmd.preconfigurationContent = cmd.preconfigurationContent if cmd.preconfigurationContent != "" else """
+        {{ extra_repo }}
+        {{ REPO_URL }}
+        {{ SYS_USERNAME }}
+        {{ SYS_PASSWORD }}
+        {{ NETWORK_CFGS }}
+        {{ FORCE_INSTALL }}
+        {{ PRE_SCRIPTS }}
+        {{ POST_SCRIPTS }}
+        """
+
+        pxeserver_dhcp_nic_ip = self._get_ip_address(cmd.dhcpInterface).strip()
+        if cmd.preconfigurationType == 'kickstart':
+            rendered_content = self._render_kickstart_template(cmd, pxeserver_dhcp_nic_ip)
+        elif cmd.preconfigurationType == 'preseed':
+            rendered_content = self._render_preseed_template(cmd, pxeserver_dhcp_nic_ip)
+        elif cmd.preconfigurationType == 'autoyast':
+            rendered_content = self._render_autoyast_template(cmd, pxeserver_dhcp_nic_ip)
+        else:
+            raise PxeServerError("unkown preconfiguration type %s" % cmd.preconfigurationType)
+
+        ks_cfg_name = cmd.pxeNicMac.replace(":", "-")
+        ks_cfg_file = os.path.join(self.KS_CFG_PATH, ks_cfg_name)
+        with open(ks_cfg_file, 'w') as f:
+            f.write(rendered_content)
+
+    def _create_pre_scripts(self, cmd, pxeserver_dhcp_nic_ip, more_script = ""):
+        # poweroff and abort the provisioning process if failed to send `deploybegin` command
+        pre_script = """# notify deploy begin
+curl --fail -X POST -H "Content-Type:application/json" \
+-H "commandpath:/baremetal/instance/deploybegin" \
+-d {{"baremetalInstanceUuid":"{BMUUID}"}} \
+--retry 3 \
+http://{PXESERVER_DHCP_NIC_IP}:7771/zstack/asyncrest/sendcommand || poweroff
+""".format(BMUUID=cmd.bmUuid, PXESERVER_DHCP_NIC_IP=pxeserver_dhcp_nic_ip)
+
+        pre_script += more_script
+        with open(os.path.join(self.ZSTACK_SCRIPTS_PATH, "pre_%s.sh" % cmd.bmUuid), 'w') as f:
+            f.write(pre_script)
+
+    def _create_post_scripts(self, cmd, pxeserver_dhcp_nic_ip, more_script = ""):
+        post_script = """# notify deploy complete
+curl -X POST -H "Content-Type:application/json" \
+-H "commandpath:/baremetal/instance/deploycomplete" \
+-d {{"baremetalInstanceUuid":"{BMUUID}"}} \
+--retry 5 \
+http://{PXESERVER_DHCP_NIC_IP}:7771/zstack/asyncrest/sendcommand
+
+# baby agent
+wget -P /usr/bin ftp://{PXESERVER_DHCP_NIC_IP}/shellinaboxd || curl -o /usr/bin/shellinaboxd ftp://{PXESERVER_DHCP_NIC_IP}/shellinaboxd
+chmod a+x /usr/bin/shellinaboxd
+
+if [ ! -f /etc/rc.local ]; then
+cat > /etc/rc.local << EOF
+#!/bin/bash
+EOF
+chmod a+x /etc/rc.local
+fi
+[ -f /etc/rc.d/rc.local ] && chmod a+x /etc/rc.d/rc.local
+cat >> /etc/rc.local << EOF
+iptables-save | grep -- "-I INPUT -p tcp -m tcp --dport 4200 -j ACCEPT" > /dev/null || (iptables -I INPUT -p tcp -m tcp --dport 4200 -j ACCEPT && service iptables save)
+firewall-cmd --query-port=4200/tcp || (firewall-cmd --zone=public --add-port=4200/tcp --permanent && service firewalld restart)
+shellinaboxd -b -t -s /:SSH:127.0.0.1
+curl -X POST -H "Content-Type:application/json" \
+-H "commandpath:/baremetal/instance/osrunning" \
+-d {{"baremetalInstanceUuid":"{BMUUID}"}} \
+--retry 5 \
+http://{PXESERVER_DHCP_NIC_IP}:7771/zstack/asyncrest/sendcommand
+EOF
+""".format(BMUUID=cmd.bmUuid, PXESERVER_DHCP_NIC_IP=pxeserver_dhcp_nic_ip)
+
+        post_script += more_script
+        with open(os.path.join(self.ZSTACK_SCRIPTS_PATH, "post_%s.sh" % cmd.bmUuid), 'w') as f:
+            f.write(post_script)
+
+    def _render_kickstart_template(self, cmd, pxeserver_dhcp_nic_ip):
+        is_zstack_iso = os.path.exists(os.path.join(self.VSFTPD_ROOT_PATH, cmd.imageUuid, "Extra", "qemu-kvm-ev"))
+        self._create_pre_scripts(cmd, pxeserver_dhcp_nic_ip)
+        self._create_post_scripts(cmd, pxeserver_dhcp_nic_ip)
+
+        context = dict()
+        context['REPO_URL'] = "ftp://%s/%s/" % (pxeserver_dhcp_nic_ip, cmd.imageUuid)
+        context['USERNAME'] = cmd.username
+        context['PASSWORD'] = cmd.password
+        context['PRE_SCRIPTS'] = 'sh -c "$(curl -fsSL ftp://%s/scripts/pre_%s.sh)"' % (pxeserver_dhcp_nic_ip, cmd.bmUuid)
+        context['POST_SCRIPTS'] = 'sh -c "$(curl -fsSL ftp://%s/scripts/post_%s.sh)"' % (pxeserver_dhcp_nic_ip, cmd.bmUuid)
+        context['FORCE_INSTALL'] = "clearpart --all --initlabel" if cmd.forceInstall else ""
+
+        niccfgs = json_object.loads(cmd.nicCfgs) if cmd.nicCfgs is not None else []
+        nic_cfg_content = """
+{% for cfg in niccfgs %}
+network --bootproto=static --onboot=yes --noipv6
+{%- if cfg.pxe -%}
+{{PH}} --activate
+{%- else -%}
+{{PH}} --nodefroute
+{%- endif -%}
+
+{%- if cfg.bondName -%}
+{{PH}} --device {{ cfg.bondName }} --bondslaves {{ cfg.bondSlaves }} --bondopts="mode={{ cfg.bondMode }} {{ cfg.bondOpts }}"
+{%- else -%}
+{{PH}} --device {{ cfg.mac }}
+{%- endif -%}
+
+{{PH}} --ip={{ cfg.ip }} --netmask={{ cfg.netmask }} --gateway={{ cfg.gateway }} --nameserver={{ cfg.nameserver }}
+
+{%- if cfg.vlanid -%}
+{{PH}} --vlanid={{ cfg.vlanid }}
+{%- endif -%}
+{% endfor %}
+"""
+        nic_cfg_tmpl = Template(nic_cfg_content)
+        context['NETWORK_CFGS'] = nic_cfg_tmpl.render(niccfgs=niccfgs)
+
+        if is_zstack_iso:
+            context['extra_repo'] = "repo --name=qemu-kvm-ev --baseurl=ftp://%s/%s/Extra/qemu-kvm-ev" % (pxeserver_dhcp_nic_ip, cmd.imageUuid)
+            context['pxeserver_dhcp_nic_ip'] = pxeserver_dhcp_nic_ip
+
+        custom = json_object.loads(cmd.customPreconfigurations) if cmd.customPreconfigurations is not None else {}
+        context.update(custom)
+
+        tmpl = Template(cmd.preconfigurationContent)
+        return tmpl.render(context)
+
+    def _render_preseed_template(self, cmd, pxeserver_dhcp_nic_ip):
+        niccfgs = json_object.loads(cmd.nicCfgs) if cmd.nicCfgs is not None else []
+
+        self._create_pre_scripts(cmd, pxeserver_dhcp_nic_ip)
+        self._create_post_scripts(cmd, pxeserver_dhcp_nic_ip)
+
+        context = dict()
+        context['REPO_URL'] = ("d-i mirror/protocol string ftp"
+                               "d-i mirror/ftp/hostname string {PXESERVER_DHCP_NIC_IP}" 
+                               "d-i mirror/ftp/directory string /{IMAGEUUID}")\
+            .format(PXESERVER_DHCP_NIC_IP=pxeserver_dhcp_nic_ip, IMAGEUUID=cmd.imageUuid)
+        context['USERNAME'] = cmd.username
+        context['PASSWORD'] = cmd.password
+        context['PRE_SCRIPTS'] = 'sh -c "$(curl -fsSL ftp://%s/scripts/pre_%s.sh)"' % (pxeserver_dhcp_nic_ip, cmd.bmUuid)
+        context['POST_SCRIPTS'] = 'sh -c "$(curl -fsSL ftp://%s/scripts/post_%s.sh)"' % (pxeserver_dhcp_nic_ip, cmd.bmUuid)
+
+        custom = json_object.loads(cmd.customPreconfigurations) if cmd.customPreconfigurations is not None else {}
+        context.update(custom)
+
+        tmpl = Template(cmd.preconfigurationContent)
+        return tmpl.render(context)
+
+    def _render_autoyast_template(self, cmd, pxeserver_dhcp_nic_ip):
+        niccfgs = json_object.loads(cmd.nicCfgs) if cmd.nicCfgs is not None else []
+
+        self._create_pre_scripts(cmd, pxeserver_dhcp_nic_ip)
+        self._create_post_scripts(cmd, pxeserver_dhcp_nic_ip)
+
+        context = dict()
+        context['USERNAME'] = cmd.username
+        context['PASSWORD'] = cmd.password
+        context['PRE_SCRIPTS'] = 'sh -c "$(curl -fsSL ftp://%s/scripts/pre_%s.sh)"' % (pxeserver_dhcp_nic_ip, cmd.bmUuid)
+        context['POST_SCRIPTS'] = 'sh -c "$(curl -fsSL ftp://%s/scripts/post_%s.sh)"' % (pxeserver_dhcp_nic_ip, cmd.bmUuid)
+
+        custom = json_object.loads(cmd.customPreconfigurations) if cmd.customPreconfigurations is not None else {}
+        context.update(custom)
+
+        tmpl = Template(cmd.preconfigurationContent)
+        return tmpl.render(context)
 
     @reply_error
     def delete_bm_configs(self, req):
