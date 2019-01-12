@@ -9,6 +9,7 @@ import fcntl
 import struct
 import hashlib
 import traceback
+import simplejson
 from jinja2 import Template
 from netaddr import IPNetwork, IPAddress
 
@@ -233,6 +234,7 @@ tftp-root={TFTPBOOT_PATH}
 log-facility={DNSMASQ_LOG_PATH}
 dhcp-range={DHCP_RANGE}
 dhcp-option=1,{DHCP_NETMASK}
+dhcp-option=6,223.5.5.5,8.8.8.8
 dhcp-hostsfile={HOSTS_DHCP_FILE}
 """.format(DHCP_INTERFACE=cmd.dhcpInterface,
            DHCP_RANGE="%s,%s,%s" % (cmd.dhcpRangeBegin, cmd.dhcpRangeEnd, cmd.dhcpRangeNetmask),
@@ -424,6 +426,7 @@ http {
     @reply_error
     def create_bm_configs(self, req):
         cmd = json_object.loads(req[http.REQUEST_BODY])
+        cmd.pxeNicMac = cmd.pxeNicMac.replace(":", "-")
         rsp = AgentResponse()
 
         # check preconfiguration md5sum
@@ -438,7 +441,7 @@ http {
         return json_object.dumps(rsp)
 
     def _create_pxelinux_cfg(self, cmd):
-        ks_cfg_name = cmd.pxeNicMac.replace(":", "-")
+        ks_cfg_name = cmd.pxeNicMac
         pxe_cfg_file = os.path.join(self.PXELINUX_CFG_PATH, "01-" + ks_cfg_name)
         pxeserver_dhcp_nic_ip = self._get_ip_address(cmd.dhcpInterface).strip()
 
@@ -446,9 +449,9 @@ http {
         if cmd.preconfigurationType == 'kickstart':
             append = 'devfs=nomount ksdevice=bootif ks=ftp://{PXESERVER_DHCP_NIC_IP}/ks/{KS_CFG_NAME} vnc'
         elif cmd.preconfigurationType == 'preseed':
-            append = 'auto=true priority=critical url=ftp://{PXESERVER_DHCP_NIC_IP}/ks/{KS_CFG_NAME}'
+            append = 'interface=auto auto=true priority=critical url=ftp://{PXESERVER_DHCP_NIC_IP}/ks/{KS_CFG_NAME}'
         elif cmd.preconfigurationType == 'autoyast':
-            append = 'install=ftp://{PXESERVER_DHCP_NIC_IP}/{IMAGEUUID}/ autoyast=ftp://{PXESERVER_DHCP_NIC_IP}/ks/{KS_CFG_NAME} vnc'
+            append = 'install=ftp://{PXESERVER_DHCP_NIC_IP}/{IMAGEUUID}/ autoyast=ftp://{PXESERVER_DHCP_NIC_IP}/ks/{KS_CFG_NAME} vnc=1 vncpassword=password'
         append = append.format(PXESERVER_DHCP_NIC_IP=pxeserver_dhcp_nic_ip,
                 IMAGEUUID=cmd.imageUuid,
                 KS_CFG_NAME=ks_cfg_name)
@@ -490,7 +493,7 @@ http {
         else:
             raise PxeServerError("unkown preconfiguration type %s" % cmd.preconfigurationType)
 
-        ks_cfg_name = cmd.pxeNicMac.replace(":", "-")
+        ks_cfg_name = cmd.pxeNicMac
         ks_cfg_file = os.path.join(self.KS_CFG_PATH, ks_cfg_name)
         with open(ks_cfg_file, 'w') as f:
             f.write(rendered_content)
@@ -502,46 +505,64 @@ curl --fail -X POST -H "Content-Type:application/json" \
 -H "commandpath:/baremetal/instance/deploybegin" \
 -d {{"baremetalInstanceUuid":"{BMUUID}"}} \
 --retry 3 \
-http://{PXESERVER_DHCP_NIC_IP}:7771/zstack/asyncrest/sendcommand || poweroff
+http://{PXESERVER_DHCP_NIC_IP}:7771/zstack/asyncrest/sendcommand || \
+wget -O- --header="Content-Type:application/json" \
+--header="commandpath:/baremetal/instance/deploybegin" \
+--post-data={{"baremetalInstanceUuid":"{BMUUID}"}} \
+--tries=3 \
+http://{PXESERVER_DHCP_NIC_IP}:7771/zstack/asyncrest/sendcommand || \
+poweroff
 """.format(BMUUID=cmd.bmUuid, PXESERVER_DHCP_NIC_IP=pxeserver_dhcp_nic_ip)
 
         pre_script += more_script
-        with open(os.path.join(self.ZSTACK_SCRIPTS_PATH, "pre_%s.sh" % cmd.bmUuid), 'w') as f:
+        with open(os.path.join(self.ZSTACK_SCRIPTS_PATH, "pre_%s.sh" % cmd.pxeNicMac), 'w') as f:
             f.write(pre_script)
 
     def _create_post_scripts(self, cmd, pxeserver_dhcp_nic_ip, more_script = ""):
-        post_script = """# notify deploy complete
+        post_script = more_script
+        post_script += """# notify deploy complete
 curl -X POST -H "Content-Type:application/json" \
 -H "commandpath:/baremetal/instance/deploycomplete" \
 -d {{"baremetalInstanceUuid":"{BMUUID}"}} \
 --retry 5 \
+http://{PXESERVER_DHCP_NIC_IP}:7771/zstack/asyncrest/sendcommand || \
+wget -O- --header="Content-Type:application/json" \
+--header="commandpath:/baremetal/instance/deploycomplete" \
+--post-data={{"baremetalInstanceUuid":"{BMUUID}"}} \
+--tries=5 \
 http://{PXESERVER_DHCP_NIC_IP}:7771/zstack/asyncrest/sendcommand
 
 # baby agent
 wget -P /usr/bin ftp://{PXESERVER_DHCP_NIC_IP}/shellinaboxd || curl -o /usr/bin/shellinaboxd ftp://{PXESERVER_DHCP_NIC_IP}/shellinaboxd
 chmod a+x /usr/bin/shellinaboxd
 
-if [ ! -f /etc/rc.local ]; then
-cat > /etc/rc.local << EOF
+[ -f /etc/rc.local ] && cp /etc/rc.local /etc/rc.local.bck
+[ -f /etc/init.d/after.local ] && cp /etc/init.d/after.local /etc/init.d/after.local.bck
+for init_file in /etc/rc.local /etc/init.d/after.local
+do
+cat > $init_file << EOF
 #!/bin/bash
-EOF
-chmod a+x /etc/rc.local
-fi
-[ -f /etc/rc.d/rc.local ] && chmod a+x /etc/rc.d/rc.local
-cat >> /etc/rc.local << EOF
 iptables-save | grep -- "-I INPUT -p tcp -m tcp --dport 4200 -j ACCEPT" > /dev/null || (iptables -I INPUT -p tcp -m tcp --dport 4200 -j ACCEPT && service iptables save)
 firewall-cmd --query-port=4200/tcp || (firewall-cmd --zone=public --add-port=4200/tcp --permanent && service firewalld restart)
 shellinaboxd -b -t -s /:SSH:127.0.0.1
+
 curl -X POST -H "Content-Type:application/json" \
 -H "commandpath:/baremetal/instance/osrunning" \
 -d {{"baremetalInstanceUuid":"{BMUUID}"}} \
 --retry 5 \
+http://{PXESERVER_DHCP_NIC_IP}:7771/zstack/asyncrest/sendcommand || \
+wget -O- --header="Content-Type:application/json" \
+--header="commandpath:/baremetal/instance/osrunning" \
+--post-data={{"baremetalInstanceUuid":"{BMUUID}"}} \
+--tries=5 \
 http://{PXESERVER_DHCP_NIC_IP}:7771/zstack/asyncrest/sendcommand
-EOF
-""".format(BMUUID=cmd.bmUuid, PXESERVER_DHCP_NIC_IP=pxeserver_dhcp_nic_ip)
 
-        post_script += more_script
-        with open(os.path.join(self.ZSTACK_SCRIPTS_PATH, "post_%s.sh" % cmd.bmUuid), 'w') as f:
+exit 0
+EOF
+chmod a+x $init_file
+done
+""".format(BMUUID=cmd.bmUuid, PXESERVER_DHCP_NIC_IP=pxeserver_dhcp_nic_ip)
+        with open(os.path.join(self.ZSTACK_SCRIPTS_PATH, "post_%s.sh" % cmd.pxeNicMac), 'w') as f:
             f.write(post_script)
 
     def _render_kickstart_template(self, cmd, pxeserver_dhcp_nic_ip):
@@ -551,10 +572,10 @@ EOF
 
         context = dict()
         context['REPO_URL'] = "ftp://%s/%s/" % (pxeserver_dhcp_nic_ip, cmd.imageUuid)
-        context['USERNAME'] = cmd.username
+        context['USERNAME'] = "" if cmd.username == 'root' else cmd.username
         context['PASSWORD'] = cmd.password
-        context['PRE_SCRIPTS'] = 'sh -c "$(curl -fsSL ftp://%s/scripts/pre_%s.sh)"' % (pxeserver_dhcp_nic_ip, cmd.bmUuid)
-        context['POST_SCRIPTS'] = 'sh -c "$(curl -fsSL ftp://%s/scripts/post_%s.sh)"' % (pxeserver_dhcp_nic_ip, cmd.bmUuid)
+        context['PRE_SCRIPTS'] = 'sh -c "$(curl -fsSL ftp://%s/scripts/pre_%s.sh)"' % (pxeserver_dhcp_nic_ip, cmd.pxeNicMac)
+        context['POST_SCRIPTS'] = 'sh -c "$(curl -fsSL ftp://%s/scripts/post_%s.sh)"' % (pxeserver_dhcp_nic_ip, cmd.pxeNicMac)
         context['FORCE_INSTALL'] = "clearpart --all --initlabel" if cmd.forceInstall else ""
 
         niccfgs = json_object.loads(cmd.nicCfgs) if cmd.nicCfgs is not None else []
@@ -587,47 +608,123 @@ network --bootproto=static --onboot=yes --noipv6
             context['extra_repo'] = "repo --name=qemu-kvm-ev --baseurl=ftp://%s/%s/Extra/qemu-kvm-ev" % (pxeserver_dhcp_nic_ip, cmd.imageUuid)
             context['pxeserver_dhcp_nic_ip'] = pxeserver_dhcp_nic_ip
 
-        custom = json_object.loads(cmd.customPreconfigurations) if cmd.customPreconfigurations is not None else {}
+        custom = simplejson.loads(cmd.customPreconfigurations) if cmd.customPreconfigurations is not None else {}
         context.update(custom)
 
         tmpl = Template(cmd.preconfigurationContent)
         return tmpl.render(context)
 
     def _render_preseed_template(self, cmd, pxeserver_dhcp_nic_ip):
-        niccfgs = json_object.loads(cmd.nicCfgs) if cmd.nicCfgs is not None else []
-
-        self._create_pre_scripts(cmd, pxeserver_dhcp_nic_ip)
-        self._create_post_scripts(cmd, pxeserver_dhcp_nic_ip)
-
         context = dict()
-        context['REPO_URL'] = ("d-i mirror/protocol string ftp"
-                               "d-i mirror/ftp/hostname string {PXESERVER_DHCP_NIC_IP}" 
+        context['REPO_URL'] = ("d-i mirror/protocol string ftp\n"
+                               "d-i mirror/ftp/hostname string {PXESERVER_DHCP_NIC_IP}\n"
                                "d-i mirror/ftp/directory string /{IMAGEUUID}")\
             .format(PXESERVER_DHCP_NIC_IP=pxeserver_dhcp_nic_ip, IMAGEUUID=cmd.imageUuid)
         context['USERNAME'] = cmd.username
         context['PASSWORD'] = cmd.password
-        context['PRE_SCRIPTS'] = 'sh -c "$(curl -fsSL ftp://%s/scripts/pre_%s.sh)"' % (pxeserver_dhcp_nic_ip, cmd.bmUuid)
-        context['POST_SCRIPTS'] = 'sh -c "$(curl -fsSL ftp://%s/scripts/post_%s.sh)"' % (pxeserver_dhcp_nic_ip, cmd.bmUuid)
+        context['PRE_SCRIPTS'] = 'wget -O- ftp://%s/scripts/pre_%s.sh | /bin/sh -s' % (pxeserver_dhcp_nic_ip, cmd.pxeNicMac)
+        context['POST_SCRIPTS'] = 'wget -O- ftp://%s/scripts/post_%s.sh | chroot /target /bin/sh -s' % (pxeserver_dhcp_nic_ip, cmd.pxeNicMac)
+        context['FORCE_INSTALL'] = 'd-i partman-partitioning/confirm_write_new_label boolean true\n' \
+                                   'd-i partman/choose_partition select finish\n' \
+                                   'd-i partman/confirm boolean true\n' \
+                                   'd-i partman/confirm_nooverwrite boolean true\n' \
+                                   'd-i partman-md/confirm_nooverwrite boolean true\n' \
+                                   'd-i partman-lvm/confirm_nooverwrite boolean true' if cmd.forceInstall else ""
 
-        custom = json_object.loads(cmd.customPreconfigurations) if cmd.customPreconfigurations is not None else {}
+        niccfgs = json_object.loads(cmd.nicCfgs) if cmd.nicCfgs is not None else []
+        # post script snippet for network configuration
+        niccfg_post_script = """echo 'loop lp rtc bonding 8021q' >> /etc/modules
+{% for cfg in niccfgs %}
+
+{% if cfg.bondName %}
+DEVNAME={{ cfg.bondName }}{%- if cfg.vlanid -%}.{{ cfg.vlanid }}{%- endif -%}
+{% else %}
+DEVNAME=`ip -o link show | grep {{ cfg.mac }} | awk -F ': ' '{ printf $2 }'`{%- if cfg.vlanid -%}.{{ cfg.vlanid }}{%- endif -%}
+{% endif %}
+
+echo "auto ${DEVNAME}" >> /etc/network/interfaces
+echo "iface ${DEVNAME} inet manual" >> /etc/network/interfaces
+echo 'address {{ cfg.ip }}' >> /etc/network/interfaces
+echo 'netmask {{ cfg.netmask }}' >> /etc/network/interfaces
+echo 'gateway {{ cfg.gateway }}' >> /etc/network/interfaces
+
+{% if cfg.bondName %}
+echo 'bond-mode {{ cfg.bondMode }} >> /etc/network/interfaces
+echo '{{ cfg.bondOpts }}' >> /etc/network/interfaces
+echo 'bond-slaves '{%- for slave in cfg.bondSlaves -%}`ip -o link show | grep {{ slave }} | awk -F ': ' '{ printf $2 }'` {{ PH }}{%- endfor -%}
+{% endif %}
+
+{% if cfg.vlanid %}
+RAWDEVNAME=`ip -o link show | grep {{ cfg.mac }} | awk -F ': ' '{ printf $2 }'`
+echo "vlan-raw-device ${RAWDEVNAME}" >> /etc/network/interfaces
+{% endif %}
+
+{% endfor %}
+"""
+        niccfg_post_tmpl = Template(niccfg_post_script)
+        for cfg in niccfgs:
+            if cfg.bondName:
+                cfg.bondSlaves = cfg.bondSlaves.split(',')
+        self._create_pre_scripts(cmd, pxeserver_dhcp_nic_ip)
+        self._create_post_scripts(cmd, pxeserver_dhcp_nic_ip, niccfg_post_tmpl.render(niccfgs=niccfgs))
+
+        custom = simplejson.loads(cmd.customPreconfigurations) if cmd.customPreconfigurations is not None else {}
         context.update(custom)
 
         tmpl = Template(cmd.preconfigurationContent)
         return tmpl.render(context)
 
     def _render_autoyast_template(self, cmd, pxeserver_dhcp_nic_ip):
-        niccfgs = json_object.loads(cmd.nicCfgs) if cmd.nicCfgs is not None else []
-
-        self._create_pre_scripts(cmd, pxeserver_dhcp_nic_ip)
-        self._create_post_scripts(cmd, pxeserver_dhcp_nic_ip)
-
         context = dict()
         context['USERNAME'] = cmd.username
         context['PASSWORD'] = cmd.password
-        context['PRE_SCRIPTS'] = 'sh -c "$(curl -fsSL ftp://%s/scripts/pre_%s.sh)"' % (pxeserver_dhcp_nic_ip, cmd.bmUuid)
-        context['POST_SCRIPTS'] = 'sh -c "$(curl -fsSL ftp://%s/scripts/post_%s.sh)"' % (pxeserver_dhcp_nic_ip, cmd.bmUuid)
+        context['PRE_SCRIPTS'] = 'sh -c "$(curl -fsSL ftp://%s/scripts/pre_%s.sh)"' % (pxeserver_dhcp_nic_ip, cmd.pxeNicMac)
+        context['POST_SCRIPTS'] = 'sh -c "$(curl -fsSL ftp://%s/scripts/post_%s.sh)"' % (pxeserver_dhcp_nic_ip, cmd.pxeNicMac)
+        context['FORCE_INSTALL'] = 'false' if cmd.forceInstall else 'true'
 
-        custom = json_object.loads(cmd.customPreconfigurations) if cmd.customPreconfigurations is not None else {}
+        niccfgs = json_object.loads(cmd.nicCfgs) if cmd.nicCfgs is not None else []
+        # post script snippet for network configuration
+        niccfg_post_script = """
+{% for cfg in niccfgs %}
+{% if cfg.bondName %}
+IFCFGFILE=/etc/sysconfig/network/ifcfg-{{ cfg.bondName }}{%- if cfg.vlanid -%}.{{ cfg.vlanid }}{%- endif -%}
+{% else %}
+DEVNAME=`ip -o link show | grep {{ cfg.mac }} | awk -F ': ' '{ printf "%s", $2 }'`
+IFCFGFILE=/etc/sysconfig/network/ifcfg-${DEVNAME}{%- if cfg.vlanid -%}.{{ cfg.vlanid }}{%- endif -%}
+{% endif %}
+
+echo "BOOTPROTO=static" > $IFCFGFILE
+echo "IPADDR={{ cfg.ip }}" >> $IFCFGFILE
+echo "NETMASK={{ cfg.netmask }}" >> $IFCFGFILE
+echo "BROADCAST=" >> $IFCFGFILE
+echo "NETWORK=" >> $IFCFGFILE
+echo "STARTMODE=auto" >> $IFCFGFILE
+
+{% if cfg.bondName %}
+echo "BONDING_MASTER='yes' >> $IFCFGFILE
+echo "BONDING_MODULE_OPTS='mode={{ cfg.bondMode }} {{ cfg.bondOpts }}'" >> $IFCFGFILE
+{% for slave in cfg.bondSlaves %}
+SLAVENAME=`ip -o link show | grep {{ slave }} | awk -F ': ' '{ printf "%s", $2 }'`
+echo "BONDING_SLAVE{{ loop.index0 }}='${ SLAVENAME }'" >> $IFCFGFILE
+echo -e "BOOTPROTO='none'\nSTARTMODE='hotplug'" > /etc/sysconfig/network/ifcfg-${SLAVENAME}
+{% endfor %}
+{% endif %}
+
+{% if cfg.vlanid %}
+echo "ETHERDEVICE=${DEVNAME}" >> $IFCFGFILE
+echo "VLAN_ID={{ cfg.vlanid }}" >> $IFCFGFILE
+{% endif %}
+
+{% endfor %}
+"""
+        niccfg_post_tmpl = Template(niccfg_post_script)
+        for cfg in niccfgs:
+            if cfg.bondName:
+                cfg.bondSlaves = cfg.bondSlaves.split(',')
+        self._create_pre_scripts(cmd, pxeserver_dhcp_nic_ip)
+        self._create_post_scripts(cmd, pxeserver_dhcp_nic_ip, niccfg_post_tmpl.render(niccfgs=niccfgs))
+
+        custom = simplejson.loads(cmd.customPreconfigurations) if cmd.customPreconfigurations is not None else {}
         context.update(custom)
 
         tmpl = Template(cmd.preconfigurationContent)
@@ -651,13 +748,21 @@ network --bootproto=static --onboot=yes --noipv6
             if os.path.exists(self.NOVNC_TOKEN_PATH):
                 bash_r("rm -f %s/*" % self.NOVNC_TOKEN_PATH)
         else:
-            pxe_cfg_file = os.path.join(self.PXELINUX_CFG_PATH, "01-" + cmd.pxeNicMac.replace(":", "-"))
+            mac_as_name = cmd.pxeNicMac.replace(":", "-")
+            pxe_cfg_file = os.path.join(self.PXELINUX_CFG_PATH, "01-" + mac_as_name)
             if os.path.exists(pxe_cfg_file):
                 os.remove(pxe_cfg_file)
 
-            ks_cfg_file = os.path.join(self.KS_CFG_PATH, cmd.pxeNicMac.replace(":", "-"))
+            ks_cfg_file = os.path.join(self.KS_CFG_PATH, mac_as_name)
             if os.path.exists(ks_cfg_file):
                 os.remove(ks_cfg_file)
+
+            pre_script_file = os.path.join(self.ZSTACK_SCRIPTS_PATH, "pre_%s.sh" % mac_as_name)
+            if os.path.exists(pre_script_file):
+                os.remove(pre_script_file)
+            post_script_file = os.path.join(self.ZSTACK_SCRIPTS_PATH, "post_%s.sh" % mac_as_name)
+            if os.path.exists(post_script_file):
+                os.remove(post_script_file)
 
         logger.info("successfully deleted pxelinux.cfg and ks.cfg %s" % cmd.pxeNicMac if cmd.pxeNicMac != '*' else 'all')
         return json_object.dumps(rsp)
@@ -734,9 +839,16 @@ network --bootproto=static --onboot=yes --noipv6
         vmlinuz_path = os.path.join(self.TFTPBOOT_PATH, cmd.imageUuid)
         if not os.path.exists(vmlinuz_path):
             os.makedirs(vmlinuz_path)
+        # RHEL
         ret1 = bash_r("cp %s %s" % (os.path.join(mount_path, "isolinux/vmlinuz*"), os.path.join(vmlinuz_path, "vmlinuz")))
         ret2 = bash_r("cp %s %s" % (os.path.join(mount_path, "isolinux/initrd*.img"), os.path.join(vmlinuz_path, "initrd.img")))
-        if ret1 != 0 or ret2 != 0:
+        # DEBIAN SERVER
+        ret3 = bash_r("cp %s %s" % (os.path.join(mount_path, "install/netboot/*-installer/amd64/linux"), os.path.join(vmlinuz_path, "vmlinuz")))
+        ret4 = bash_r("cp %s %s" % (os.path.join(mount_path, "install/netboot/*-installer/amd64/initrd.gz"), os.path.join(vmlinuz_path, "initrd.img")))
+        # SUSE
+        ret5 = bash_r("cp %s %s" % (os.path.join(mount_path, "boot/*/loader/linux"), os.path.join(vmlinuz_path, "vmlinuz")))
+        ret6 = bash_r("cp %s %s" % (os.path.join(mount_path, "boot/*/loader/initrd"), os.path.join(vmlinuz_path, "initrd.img")))
+        if (ret1 != 0 or ret2 != 0) and (ret3 != 0 or ret4 != 0) and (ret5 != 0 or ret6 != 0):
             raise PxeServerError("failed to copy vmlinuz and initrd.img from image[uuid:%s] to baremetal tftp server" % cmd.imageUuid)
 
         logger.info("successfully downloaded image[uuid:%s] and mounted it" % cmd.imageUuid)
