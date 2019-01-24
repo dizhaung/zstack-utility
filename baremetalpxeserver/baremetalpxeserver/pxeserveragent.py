@@ -82,6 +82,8 @@ class PxeServerAgent(object):
     DELETE_BM_NGINX_PROXY_PATH = "/baremetal/pxeserver/deletebmnginxproxy"
     CREATE_BM_NOVNC_PROXY_PATH = "/baremetal/pxeserver/createbmnovncproxy"
     DELETE_BM_NOVNC_PROXY_PATH = "/baremetal/pxeserver/deletebmnovncproxy"
+    CREATE_BM_DHCP_CONFIG_PATH = "/baremetal/pxeserver/createdhcpconfig"
+    DELETE_BM_DHCP_CONFIG_PATH = "/baremetal/pxeserver/deletedhcpconfig"
     DOWNLOAD_FROM_IMAGESTORE_PATH = "/baremetal/pxeserver/imagestore/download"
     DOWNLOAD_FROM_CEPHB_PATH = "/baremetal/pxeserver/cephb/download"
     DELETE_BM_IMAGE_CACHE_PATH = "/baremetal/pxeserver/deletecache"
@@ -92,7 +94,7 @@ class PxeServerAgent(object):
     BAREMETAL_LIB_PATH = "/var/lib/zstack/baremetal/"
     BAREMETAL_LOG_PATH = "/var/log/zstack/baremetal/"
     DNSMASQ_CONF_PATH = BAREMETAL_LIB_PATH + "dnsmasq/dnsmasq.conf"
-    HOSTS_DHCP_FILE = BAREMETAL_LIB_PATH + "dnsmasq/hosts.dhcp"
+    DHCP_HOSTS_DIR = BAREMETAL_LIB_PATH + "dnsmasq/hosts"
     DNSMASQ_LOG_PATH = BAREMETAL_LOG_PATH + "dnsmasq.log"
     TFTPBOOT_PATH = BAREMETAL_LIB_PATH + "tftpboot/"
     VSFTPD_CONF_PATH = BAREMETAL_LIB_PATH + "vsftpd/vsftpd.conf"
@@ -128,6 +130,8 @@ class PxeServerAgent(object):
         self.http_server.register_async_uri(self.DELETE_BM_NGINX_PROXY_PATH, self.delete_bm_nginx_proxy)
         self.http_server.register_async_uri(self.CREATE_BM_NOVNC_PROXY_PATH, self.create_bm_novnc_proxy)
         self.http_server.register_async_uri(self.DELETE_BM_NOVNC_PROXY_PATH, self.delete_bm_novnc_proxy)
+        self.http_server.register_async_uri(self.CREATE_BM_DHCP_CONFIG_PATH, self.create_bm_dhcp_config)
+        self.http_server.register_async_uri(self.DELETE_BM_DHCP_CONFIG_PATH, self.delete_bm_dhcp_config)
         self.http_server.register_async_uri(self.DOWNLOAD_FROM_IMAGESTORE_PATH, self.download_imagestore)
         self.http_server.register_async_uri(self.DOWNLOAD_FROM_CEPHB_PATH, self.download_cephb)
         self.http_server.register_async_uri(self.DELETE_BM_IMAGE_CACHE_PATH, self.delete_bm_image_cache)
@@ -213,18 +217,6 @@ class PxeServerAgent(object):
         # get pxe server capacity
         self._set_capacity_to_response(rsp)
 
-        # clean up old configs
-        if os.path.exists(self.PXELINUX_CFG_PATH):
-            bash_r("rm -f %s/*" % self.PXELINUX_CFG_PATH)
-        if os.path.exists(self.KS_CFG_PATH):
-            bash_r("rm -f %s/*" % self.KS_CFG_PATH)
-        if os.path.exists(self.NGINX_MN_PROXY_CONF_PATH):
-            bash_r("rm -f %s/*" % self.NGINX_MN_PROXY_CONF_PATH)
-        if os.path.exists(self.NGINX_TERMINAL_PROXY_CONF_PATH):
-            bash_r("rm -f %s/*" % self.NGINX_TERMINAL_PROXY_CONF_PATH)
-        if os.path.exists(self.NOVNC_TOKEN_PATH):
-            bash_r("rm -f %s/*" % self.NOVNC_TOKEN_PATH)
-
         # init dnsmasq.conf
         dhcp_conf = """interface={DHCP_INTERFACE}
 port=0
@@ -235,20 +227,22 @@ log-facility={DNSMASQ_LOG_PATH}
 dhcp-range={DHCP_RANGE}
 dhcp-option=1,{DHCP_NETMASK}
 dhcp-option=6,223.5.5.5,8.8.8.8
-dhcp-hostsfile={HOSTS_DHCP_FILE}
+dhcp-hostsdir={DHCP_HOSTS_DIR}
 """.format(DHCP_INTERFACE=cmd.dhcpInterface,
            DHCP_RANGE="%s,%s,%s" % (cmd.dhcpRangeBegin, cmd.dhcpRangeEnd, cmd.dhcpRangeNetmask),
            DHCP_NETMASK=cmd.dhcpRangeNetmask,
            TFTPBOOT_PATH=self.TFTPBOOT_PATH,
-           HOSTS_DHCP_FILE=self.HOSTS_DHCP_FILE,
+           DHCP_HOSTS_DIR=self.DHCP_HOSTS_DIR,
            DNSMASQ_LOG_PATH=self.DNSMASQ_LOG_PATH)
         with open(self.DNSMASQ_CONF_PATH, 'w') as f:
             f.write(dhcp_conf)
 
-        # init hosts.dhcp
+        # init dhcp-hostdir
         mac_address = self._get_mac_address(cmd.dhcpInterface)
         dhcp_conf = "%s,ignore" % mac_address
-        with open(self.HOSTS_DHCP_FILE, 'w') as f:
+        if not os.path.exists(self.DHCP_HOSTS_DIR):
+            os.makedirs(self.DHCP_HOSTS_DIR)
+        with open(os.path.join(self.DHCP_HOSTS_DIR, "ignore"), 'w') as f:
             f.write(dhcp_conf)
 
         # hack nmap script
@@ -815,6 +809,30 @@ echo "VLAN_ID={{ cfg.vlanid }}" >> $IFCFGFILE
             os.remove(novnc_proxy_file)
 
         logger.info("successfully deleted novnc proxy for baremetal instance[uuid:%s] on pxeserver[uuid:%s]" % (cmd.bmUuid, self.uuid))
+        return json_object.dumps(rsp)
+
+    @reply_error
+    def create_bm_dhcp_config(self, req):
+        cmd = json_object.loads(req[http.REQUEST_BODY])
+        rsp = AgentResponse()
+
+        host_file = os.path.join(self.DHCP_HOSTS_DIR, cmd.chassisUuid)
+        with open(host_file, 'w') as f:
+            f.write("%s,%s" % (cmd.pxeNicMac, cmd.pxeNicIp))
+
+        logger.info("successfully created dhcp config for baremetal chassis[uuid:%s] on pxeserver[uuid:%s]" % (cmd.chassisUuid, self.uuid))
+        return json_object.dumps(rsp)
+
+    @reply_error
+    def delete_bm_dhcp_config(self, req):
+        cmd = json_object.loads(req[http.REQUEST_BODY])
+        rsp = AgentResponse()
+
+        host_file = os.path.join(self.DHCP_HOSTS_DIR, cmd.chassisUuid)
+        if os.path.exists(host_file):
+            os.remove(host_file)
+
+        logger.info("successfully deleted dhcp config for baremetal chassis[uuid:%s] on pxeserver[uuid:%s]" % (cmd.chassisUuid, self.uuid))
         return json_object.dumps(rsp)
 
     @in_bash
